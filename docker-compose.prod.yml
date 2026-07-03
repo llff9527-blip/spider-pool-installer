@@ -1,13 +1,15 @@
 # ============================================================
-# 站群 SEO 系统 — 生产编排(拉取 GHCR 预构建镜像,无需本地 build)
+# 站群 SEO 系统 — 生产编排(官方公开镜像 + 挂载编译产物,零 token)
 # 由 install.sh 下载到 /opt/spider-pool 并 `docker compose -f docker-compose.prod.yml up -d`。
 #
-# 与 docker-compose.yml(dev,本地 build)的区别:
-#   - backend/frontend 用 image: ghcr.io/... 而非 build 段
-#   - 迁移随后端镜像内置,启动自跑(不再挂载 database/ 与 run_migrations.sh)
-#   - 新增 upgrade_signal 卷:后端写升级信号,宿主 upgrade-watcher 监听后 pull+up
+# 设计:不构建含源码的自定义镜像(镜像须 private,pull 需 token 会泄漏);
+# 改为用**官方公开镜像**挂载 CI 编译的产物启动:
+#   - backend:  zenika/alpine-chrome(含 chromium,收录检测/快排可用)挂 ./backend/server
+#   - frontend: node:20-alpine 挂 ./frontend(Next standalone) 跑 node server.js
+#   - PG/Redis/nginx: 官方公开镜像
+# 产物(./backend、./frontend)由 install.sh 从 public Release 免 token 下载解压。
 #
-# 镜像 tag 由 .env 的 IMAGE_TAG 控制(默认 latest);升级即 pull 新 latest。
+# 迁移随后端二进制内置(pkg/migrate),启动自跑幂等迁移;升级=换产物+重启。
 # ============================================================
 
 services:
@@ -43,10 +45,14 @@ services:
       retries: 10
 
   backend:
-    image: ghcr.io/llff9527-blip/spider-fan-content-backend:${IMAGE_TAG:-latest}
+    image: zenika/alpine-chrome:latest
     container_name: seo_backend
     restart: unless-stopped
     init: true
+    # 官方 chrome 镜像默认 entrypoint 是 chrome;覆盖为运行挂载的后端二进制
+    entrypoint: ["/app/server"]
+    user: root
+    working_dir: /app
     depends_on:
       postgres:
         condition: service_healthy
@@ -71,15 +77,18 @@ services:
       AI_MODEL: ${AI_MODEL:-deepseek-chat}
       RATE_LIMIT_PER_MIN: "120"
       STATIC_ROOT: /app/html
-      # 升级系统:version.json 地址 + 升级信号文件路径(写到共享卷,宿主 watcher 读)
+      MIGRATIONS_DIR: /app/database
+      CHROME_BIN: /usr/bin/chromium-browser
       VERSION_MANIFEST_URL: ${VERSION_MANIFEST_URL:-https://raw.githubusercontent.com/llff9527-blip/spider-pool-installer/main/version.json}
       UPGRADE_FLAG_PATH: /app/signal/.upgrade-request
+    volumes:
+      # 后端产物按具体路径挂载(不整体挂 /app:ro,否则无法在其下创建 html/signal 挂载点)
+      - ./backend/server:/app/server:ro
+      - ./backend/database:/app/database:ro
+      - seo_html:/app/html
+      - ./signal:/app/signal
     ports:
       - "8095:8080"
-    volumes:
-      - seo_html:/app/html
-      # 升级信号卷:同时 bind 到宿主 ./signal,upgrade-watcher 监听该文件
-      - ./signal:/app/signal
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
       interval: 10s
@@ -87,11 +96,19 @@ services:
       retries: 6
 
   frontend:
-    image: ghcr.io/llff9527-blip/spider-fan-content-frontend:${IMAGE_TAG:-latest}
+    image: node:20-alpine
     container_name: seo_frontend
     restart: unless-stopped
+    working_dir: /app
+    # Next standalone 产物挂载到 /app,跑 node server.js
+    command: ["node", "server.js"]
+    environment:
+      HOSTNAME: "0.0.0.0"
+      PORT: "3000"
     depends_on:
       - backend
+    volumes:
+      - ./frontend:/app:ro
     ports:
       - "13000:3000"
 

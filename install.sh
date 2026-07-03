@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # ============================================================
-# Spider-Pool 一键安装 / 升级
+# Spider-Pool 一键安装 / 升级(零 token,编译产物分发)
 #   curl -fsSL https://raw.githubusercontent.com/llff9527-blip/spider-pool-installer/main/install.sh | bash
 #
-# 首次运行:安装 Docker(如缺) → 拉取 GHCR 公开镜像 → 启动全栈。
-# 再次运行:等价升级(pull 最新镜像 + 重启;后端启动自动跑幂等迁移)。
-# 幂等:任意次数重复执行安全。
+# 原理:源码不公开;CI 编译产物(后端二进制 + 前端 standalone,均不含源码)发布到本
+# 公开仓库的 Release 资产,免 token 下载。运行时用官方公开镜像(chromium/node)挂载产物。
+#
+# 首次:装 Docker(如缺) → 下载产物 → 官方镜像挂载启动全栈。
+# 再次:等价升级(重新下载最新产物 + 重启;后端启动自动跑幂等迁移)。幂等,可重复执行。
 # ============================================================
 set -euo pipefail
 
 REPO_RAW="https://raw.githubusercontent.com/llff9527-blip/spider-pool-installer/main"
+REL_BASE="https://github.com/llff9527-blip/spider-pool-installer/releases/download/latest"
 INSTALL_DIR="${SPIDER_POOL_DIR:-/opt/spider-pool}"
 COMPOSE_FILE="docker-compose.prod.yml"
 
@@ -18,7 +21,6 @@ info() { echo -e "${G}==>${N} $*"; }
 warn() { echo -e "${Y}!! ${N} $*"; }
 err()  { echo -e "${R}xx ${N} $*" >&2; }
 
-# root 检查(装 docker / 写 /opt 需要)
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
   if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else
@@ -35,11 +37,10 @@ else
   info "Docker 已安装:$(docker --version)"
 fi
 
-# compose 命令兼容
 if docker compose version >/dev/null 2>&1; then
-  DC="docker compose"
+  DC="$SUDO docker compose"
 elif command -v docker-compose >/dev/null 2>&1; then
-  DC="docker-compose"
+  DC="$SUDO docker-compose"
 else
   err "未找到 docker compose 插件,请升级 Docker(需 Compose V2)。"; exit 1
 fi
@@ -51,21 +52,32 @@ cd "$INSTALL_DIR"
 IS_UPGRADE=0
 [ -f "$INSTALL_DIR/.env" ] && IS_UPGRADE=1
 
-# ---------- 3. 下载 compose + nginx.conf ----------
+# ---------- 3. 下载编排 + 配置 ----------
 info "下载编排文件…"
 $SUDO curl -fsSL "$REPO_RAW/$COMPOSE_FILE" -o "$INSTALL_DIR/$COMPOSE_FILE"
 $SUDO curl -fsSL "$REPO_RAW/nginx.conf" -o "$INSTALL_DIR/nginx.conf"
 
-# ---------- 4. 首次生成 .env(随机密钥);升级则保留 ----------
+# ---------- 4. 下载并解压编译产物(免 token) ----------
+info "下载后端产物…"
+$SUDO curl -fsSL "$REL_BASE/backend.tar.gz" -o /tmp/sp-backend.tar.gz
+$SUDO rm -rf "$INSTALL_DIR/backend" && $SUDO mkdir -p "$INSTALL_DIR/backend"
+$SUDO tar -C "$INSTALL_DIR/backend" -xzf /tmp/sp-backend.tar.gz
+$SUDO chmod +x "$INSTALL_DIR/backend/server"
+
+info "下载前端产物…"
+$SUDO curl -fsSL "$REL_BASE/frontend.tar.gz" -o /tmp/sp-frontend.tar.gz
+$SUDO rm -rf "$INSTALL_DIR/frontend" && $SUDO mkdir -p "$INSTALL_DIR/frontend"
+$SUDO tar -C "$INSTALL_DIR/frontend" -xzf /tmp/sp-frontend.tar.gz
+$SUDO rm -f /tmp/sp-backend.tar.gz /tmp/sp-frontend.tar.gz
+
+# ---------- 5. 首次生成 .env(随机密钥);升级保留 ----------
 if [ "$IS_UPGRADE" -eq 0 ]; then
   info "首次安装:生成 .env(随机 DB 密码 / JWT 密钥)…"
   rand() { LC_ALL=C tr -dc 'a-zA-Z0-9' </dev/urandom | head -c "${1:-32}"; }
   $SUDO tee "$INSTALL_DIR/.env" >/dev/null <<EOF
-# Spider-Pool 生产配置(首次自动生成,可按需修改后重跑 install.sh 生效)
-IMAGE_TAG=latest
+# Spider-Pool 生产配置(首次自动生成)
 DB_PASSWORD=$(rand 24)
 JWT_SECRET=$(rand 40)
-# AI 凭证(留空则登录后管后在「系统设置」填写)
 AI_API_KEY=
 AI_API_URL=https://api.deepseek.com
 AI_MODEL=deepseek-chat
@@ -75,20 +87,19 @@ else
   info "检测到已安装 → 升级模式(保留现有 .env)。"
 fi
 
-# ---------- 5. 拉镜像并启动 ----------
-info "拉取最新镜像…"
-$SUDO $DC -f "$COMPOSE_FILE" pull
+# ---------- 6. 拉官方镜像并启动 ----------
+info "拉取官方运行镜像(chromium/node/postgres/redis/nginx)…"
+$DC -f "$COMPOSE_FILE" pull 2>/dev/null || true
 info "启动 / 重启服务…"
-$SUDO $DC -f "$COMPOSE_FILE" up -d
+$DC -f "$COMPOSE_FILE" up -d
 
-# ---------- 6. 安装升级 watcher + spider-pool CLI ----------
+# ---------- 7. 安装升级 watcher + spider-pool CLI ----------
 info "安装升级监听与 spider-pool 命令…"
 $SUDO curl -fsSL "$REPO_RAW/upgrade-watcher.sh" -o /usr/local/bin/spider-pool-upgrade-watcher
 $SUDO chmod +x /usr/local/bin/spider-pool-upgrade-watcher
 $SUDO curl -fsSL "$REPO_RAW/spider-pool.sh" -o /usr/local/bin/spider-pool
 $SUDO chmod +x /usr/local/bin/spider-pool
 
-# systemd 优先;无 systemd 则回退 cron
 if command -v systemctl >/dev/null 2>&1; then
   $SUDO tee /etc/systemd/system/spider-pool-watcher.service >/dev/null <<EOF
 [Unit]
@@ -110,7 +121,7 @@ else
     echo "* * * * * SPIDER_POOL_DIR=$INSTALL_DIR /usr/local/bin/spider-pool-upgrade-watcher --once" ) | $SUDO crontab -
 fi
 
-# ---------- 7. 完成 ----------
+# ---------- 8. 完成 ----------
 echo ""
 if [ "$IS_UPGRADE" -eq 1 ]; then
   info "升级完成!服务已重启为最新版本。"

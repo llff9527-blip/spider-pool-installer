@@ -1,6 +1,8 @@
 # Spider-Pool 一键安装
 
-站群 SEO 系统的公开安装器。源码仓库私有,镜像通过 GHCR 公开分发,`docker pull` 免认证。
+站群 SEO 系统的公开安装器。**源码仓库私有**;CI 编译产物(后端 Go 二进制 + 前端
+standalone 构建产物,均**不含源码**)发布到本仓库 Release,免 token 下载。运行时用
+官方公开镜像(chromium / node / postgres / redis / nginx)挂载产物启动,**全程零 token**。
 
 ## 安装 / 升级
 
@@ -44,7 +46,7 @@ spider-pool start     # 启动
 | `install.sh` | 一键安装/升级主脚本 |
 | `upgrade-watcher.sh` | 宿主升级监听器(systemd/cron),监听后端升级信号 |
 | `spider-pool.sh` | `spider-pool` 便捷运维命令 |
-| `docker-compose.prod.yml` | 生产编排(引用 GHCR 镜像) |
+| `docker-compose.prod.yml` | 生产编排(官方镜像挂载 Release 产物) |
 | `nginx.conf` | 泛站反向代理配置 |
 | `version.json` | 最新版本清单(CI 自动更新,后管据此判断有无新版) |
 
