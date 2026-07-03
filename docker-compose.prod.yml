@@ -1,0 +1,112 @@
+# ============================================================
+# 站群 SEO 系统 — 生产编排(拉取 GHCR 预构建镜像,无需本地 build)
+# 由 install.sh 下载到 /opt/spider-pool 并 `docker compose -f docker-compose.prod.yml up -d`。
+#
+# 与 docker-compose.yml(dev,本地 build)的区别:
+#   - backend/frontend 用 image: ghcr.io/... 而非 build 段
+#   - 迁移随后端镜像内置,启动自跑(不再挂载 database/ 与 run_migrations.sh)
+#   - 新增 upgrade_signal 卷:后端写升级信号,宿主 upgrade-watcher 监听后 pull+up
+#
+# 镜像 tag 由 .env 的 IMAGE_TAG 控制(默认 latest);升级即 pull 新 latest。
+# ============================================================
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: seo_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: seo_system
+      POSTGRES_USER: seo
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-seo_pass}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U seo -d seo_system"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: seo_redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    ports:
+      - "56379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    image: ghcr.io/llff9527-blip/spider-fan-content-backend:${IMAGE_TAG:-latest}
+    container_name: seo_backend
+    restart: unless-stopped
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: seo
+      DB_PASSWORD: ${DB_PASSWORD:-seo_pass}
+      DB_NAME: seo_system
+      DB_SSLMODE: disable
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ""
+      REDIS_DB: "0"
+      HTTP_PORT: "8080"
+      GIN_MODE: release
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-prod-please}
+      JWT_EXPIRE_HOURS: "72"
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_API_URL: ${AI_API_URL:-https://api.deepseek.com}
+      AI_MODEL: ${AI_MODEL:-deepseek-chat}
+      RATE_LIMIT_PER_MIN: "120"
+      STATIC_ROOT: /app/html
+      # 升级系统:version.json 地址 + 升级信号文件路径(写到共享卷,宿主 watcher 读)
+      VERSION_MANIFEST_URL: ${VERSION_MANIFEST_URL:-https://raw.githubusercontent.com/llff9527-blip/spider-pool-installer/main/version.json}
+      UPGRADE_FLAG_PATH: /app/signal/.upgrade-request
+    ports:
+      - "8095:8080"
+    volumes:
+      - seo_html:/app/html
+      # 升级信号卷:同时 bind 到宿主 ./signal,upgrade-watcher 监听该文件
+      - ./signal:/app/signal
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  frontend:
+    image: ghcr.io/llff9527-blip/spider-fan-content-frontend:${IMAGE_TAG:-latest}
+    container_name: seo_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "13000:3000"
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: seo_nginx
+    restart: unless-stopped
+    depends_on:
+      - backend
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - seo_html:/html:ro
+    ports:
+      - "80:80"
+
+volumes:
+  pgdata:
+  seo_html:
