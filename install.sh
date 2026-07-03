@@ -92,6 +92,13 @@ info "拉取官方运行镜像(chromium/node/postgres/redis/nginx)…"
 $DC -f "$COMPOSE_FILE" pull 2>/dev/null || true
 info "启动 / 重启服务…"
 $DC -f "$COMPOSE_FILE" up -d
+# 后端/前端产物是 bind-mount:文件内容变了但容器配置未变,up -d 不会重建,
+# 旧二进制/旧 standalone 仍常驻内存,导致升级后版本号不变(升级提示不消失)。
+# 升级模式下必须强制重建这两个容器,让其重新加载最新挂载产物。
+if [ "$IS_UPGRADE" -eq 1 ]; then
+  info "强制重建 backend/frontend 以加载最新产物…"
+  $DC -f "$COMPOSE_FILE" up -d --force-recreate --no-deps backend frontend
+fi
 
 # ---------- 7. 安装升级 watcher + spider-pool CLI ----------
 info "安装升级监听与 spider-pool 命令…"
